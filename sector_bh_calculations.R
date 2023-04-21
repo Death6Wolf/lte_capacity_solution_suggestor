@@ -23,7 +23,8 @@ prb_congestion_threshold <- 0.7
 prb_congestion_threshold_excl_l2600 <- 0.7
 throughput_congestion_threshold <- 5000
 throughput_congestion_threshold_excl_l2600 <- 5000
-nr_penetration_rate <- 0.2
+nr_penetration_rate <- 0.1
+cc_closure_carry_over_factor <- 0.4
 traffic_increase_upg_prop <- 0.0 # Not implemented, make it variable for congestion_recalculation()?
 
 # Functions ---------------------------------------------------------------
@@ -154,7 +155,14 @@ sector_performance_4g <-
   bh_time = median(starttime, na.rm = TRUE) %/% 10000,
   x4g_dl_data_vol = sum(x4g_data_vol_dl, na.rm = TRUE),
   x4g_plmn1_perc_dl_data_vol = sum(x4g_data_vol_dl_plmn1, na.rm = TRUE)/1000000 / sum(x4g_data_vol_dl, na.rm = TRUE)
-    ) 
+    ) |> 
+  mutate(x4g_plmn1_perc_dl_data_vol = if_else(is.infinite(x4g_plmn1_perc_dl_data_vol) | is.nan(x4g_plmn1_perc_dl_data_vol), 
+                                              0, 
+                                              pmin(x4g_plmn1_perc_dl_data_vol, 1)
+                                              ),
+         x4g_prb_dl_util_cc_closure = x4g_prb_dl_util * (1 - x4g_plmn1_perc_dl_data_vol * (1-cc_closure_carry_over_factor) ), # Assume a percentage of CC's traffic comes to us.
+         x4g_prb_dl_util_cc_dissolution = x4g_prb_dl_util * (1 - x4g_plmn1_perc_dl_data_vol)
+         )
 
 ## sector planning info ------------
 
@@ -250,7 +258,7 @@ sector_info <- sector_planned_info |>
 
 sector_info <- sector_info|> 
   mutate(
-    x4g_cong = (x4g_prb_dl_util > prb_congestion_threshold) & (x4g_prb_dl_util_excl_l2600 > prb_congestion_threshold_excl_l2600), 
+    x4g_cong = (x4g_prb_dl_util > prb_congestion_threshold) & (x4g_dl_ue_thput < throughput_congestion_threshold), 
     x4g_cong_excl_l2600 = (x4g_prb_dl_util_excl_l2600 > prb_congestion_threshold_excl_l2600) & (x4g_dl_ue_thput_excl_l2600  < throughput_congestion_threshold_excl_l2600)
   ) 
 
@@ -264,9 +272,9 @@ solution_df <- sector_info |>
     new_lte_dl_bw_total = dl_bw_recalculation(lte_dl_bw_total, x4g_prb_dl_util, x4g_cong, lte_dl_bw_1800, 20, 20),
     new_x4g_cong = new_x4g_util > prb_congestion_threshold,
     # Check if L2100 20MHz is deployed
-    upg_l2100_20 = if_else(suggestion(new_x4g_cong, lte_dl_bw_2100 + nr_dl_bw_2100, 20), 'L2100 20MHz', ''),
-    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2100 + nr_dl_bw_2100, 20, 20 - nr_dl_bw_2100),
-    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2100 + nr_dl_bw_2100, 20, 20 - nr_dl_bw_2100),
+    upg_l2100_20 = if_else(suggestion(new_x4g_cong, lte_dl_bw_2100, 20 - nr_dl_bw_2100), str_glue('L2100 {20 - nr_dl_bw_2100}MHz'), '') ,
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2100, 20 - nr_dl_bw_2100, 20 - nr_dl_bw_2100),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2100, 20 - nr_dl_bw_2100, 20 - nr_dl_bw_2100),
     new_x4g_cong = new_x4g_util > prb_congestion_threshold,
     # Check if L900 10MHz is deployed
     upg_l900_10 = if_else(suggestion(new_x4g_cong, lte_dl_bw_900, 10), 'L900 10MHz', ''),
@@ -310,13 +318,132 @@ solution_df <- sector_info |>
       str_replace_all('\\s{2,}', '; ')
   )
   
+# CC Closure -----------------------------------------------------------------
+
+# Need to adjust the throughput?
+
+sector_info_cc_closure <- sector_info|> 
+  mutate(
+    x4g_prb_dl_util = x4g_prb_dl_util_cc_closure * lte_dl_bw_total / lte_dl_bw_cc_shutdown ,
+    x4g_cong = (x4g_prb_dl_util > prb_congestion_threshold) & (x4g_dl_ue_thput < throughput_congestion_threshold), 
+    lte_dl_bw_total = lte_dl_bw_cc_shutdown
+ ) 
+
+solution_df_cc_closure <-  sector_info_cc_closure |>  
+  mutate(
+    # Check if L1800 20MHz is deployed
+    upg_l1800_20 = if_else(suggestion(x4g_cong, lte_dl_bw_1800, 20), 'L1800 20MHz', ''),
+    new_x4g_util = congestion_recalculation(lte_dl_bw_total, x4g_prb_dl_util, x4g_cong, lte_dl_bw_1800, 20, 20),
+    new_lte_dl_bw_total = dl_bw_recalculation(lte_dl_bw_total, x4g_prb_dl_util, x4g_cong, lte_dl_bw_1800, 20, 20),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if L2100 10MHz is deployed
+    upg_l2100_20 = if_else(suggestion(new_x4g_cong, lte_dl_bw_2100, 10 - nr_dl_bw_2100), str_glue('L2100 {10 - nr_dl_bw_2100}MHz'), ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2100, 10 - nr_dl_bw_2100, 10 - nr_dl_bw_2100),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2100, 10 - nr_dl_bw_2100, 10 - nr_dl_bw_2100),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if L900 5MHz is deployed
+    upg_l900_10 = if_else(suggestion(new_x4g_cong, lte_dl_bw_900, 5), 'L900 5MHz', ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_900, 5, 5),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_900, 5, 5),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if L2600 is deployed
+    upg_l2600_40 = if_else(suggestion(new_x4g_cong, lte_dl_bw_2600, 40 * tdd_adjustment), 'L2600 40MHz', ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2600, 40 * tdd_adjustment, 40 * tdd_adjustment),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2600, 40 * tdd_adjustment, 40 * tdd_adjustment),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if L800 10MHz is deployed
+    upg_l800_10 = if_else(suggestion(new_x4g_cong, lte_dl_bw_800, 10), 'L800 10MHz', ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_800, 10, 10),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_800, 10, 10),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if n3500 is deployed, assume only nr_penetration_rate % will be deloaded.
+    upg_n3500_40 = if_else(suggestion(new_x4g_cong, nr_dl_bw_3500, 40 * tdd_adjustment), 'N3500 40MHz', ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, nr_dl_bw_3500, 40 * tdd_adjustment,  40 * tdd_adjustment * nr_penetration_rate),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, nr_dl_bw_3500, 40 * tdd_adjustment,  40 * tdd_adjustment * nr_penetration_rate),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if additional spectrum is required
+    add_more_spectrum = if_else(suggestion(new_x4g_cong, 0, 100), 'Add more spectrum', ''),
+  ) |> 
+  mutate(
+    solution = str_c(upg_l1800_20, 
+                     upg_l2100_20,
+                     upg_l900_10, 
+                     upg_l2600_40, 
+                     upg_l800_10, 
+                     upg_n3500_40, 
+                     add_more_spectrum,
+                     sep = '  ') |> 
+      str_trim() |> 
+      str_replace_all('\\s{2,}', '; ')
+  )
+  
+# CC partnership dissolution -----------------------------------------------------------------
+
+# Need to adjust the throughput?
+
+sector_info_cc_dissolution <- sector_info|> 
+  mutate(
+    x4g_prb_dl_util = x4g_prb_dl_util_cc_dissolution * lte_dl_bw_total / lte_dl_bw_cc_shutdown ,
+    x4g_cong = (x4g_prb_dl_util > prb_congestion_threshold) & (x4g_dl_ue_thput < throughput_congestion_threshold), 
+    lte_dl_bw_total = lte_dl_bw_cc_shutdown
+  ) 
+
+solution_df_cc_disolution <-  sector_info_cc_dissolution |>  
+  mutate(
+    # Check if L1800 20MHz is deployed
+    upg_l1800_20 = if_else(suggestion(x4g_cong, lte_dl_bw_1800, 20), 'L1800 20MHz', ''),
+    new_x4g_util = congestion_recalculation(lte_dl_bw_total, x4g_prb_dl_util, x4g_cong, lte_dl_bw_1800, 20, 20),
+    new_lte_dl_bw_total = dl_bw_recalculation(lte_dl_bw_total, x4g_prb_dl_util, x4g_cong, lte_dl_bw_1800, 20, 20),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if L2100 10MHz is deployed
+    upg_l2100_20 = if_else(suggestion(new_x4g_cong, lte_dl_bw_2100, 10 - nr_dl_bw_2100), str_glue('L2100 {10 - nr_dl_bw_2100}MHz'), ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2100, 10 - nr_dl_bw_2100, 10 - nr_dl_bw_2100),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2100, 10 - nr_dl_bw_2100, 10 - nr_dl_bw_2100),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if L900 5MHz is deployed
+    upg_l900_10 = if_else(suggestion(new_x4g_cong, lte_dl_bw_900, 5), 'L900 5MHz', ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_900, 5, 5),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_900, 5, 5),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if L2600 is deployed
+    upg_l2600_40 = if_else(suggestion(new_x4g_cong, lte_dl_bw_2600, 40 * tdd_adjustment), 'L2600 40MHz', ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2600, 40 * tdd_adjustment, 40 * tdd_adjustment),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_2600, 40 * tdd_adjustment, 40 * tdd_adjustment),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if L800 10MHz is deployed
+    upg_l800_10 = if_else(suggestion(new_x4g_cong, lte_dl_bw_800, 10), 'L800 10MHz', ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_800, 10, 10),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, lte_dl_bw_800, 10, 10),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if n3500 is deployed, assume only nr_penetration_rate % will be deloaded.
+    upg_n3500_40 = if_else(suggestion(new_x4g_cong, nr_dl_bw_3500, 40 * tdd_adjustment), 'N3500 40MHz', ''),
+    new_x4g_util = congestion_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, nr_dl_bw_3500, 40 * tdd_adjustment,  40 * tdd_adjustment * nr_penetration_rate),
+    new_lte_dl_bw_total = dl_bw_recalculation(new_lte_dl_bw_total, new_x4g_util, new_x4g_cong, nr_dl_bw_3500, 40 * tdd_adjustment,  40 * tdd_adjustment * nr_penetration_rate),
+    new_x4g_cong = new_x4g_util > prb_congestion_threshold,
+    # Check if additional spectrum is required
+    add_more_spectrum = if_else(suggestion(new_x4g_cong, 0, 100), 'Add more spectrum', ''),
+  ) |> 
+  mutate(
+    solution = str_c(upg_l1800_20, 
+                     upg_l2100_20,
+                     upg_l900_10, 
+                     upg_l2600_40, 
+                     upg_l800_10, 
+                     upg_n3500_40, 
+                     add_more_spectrum,
+                     sep = '  ') |> 
+      str_trim() |> 
+      str_replace_all('\\s{2,}', '; ')
+  )
+
+
+#  Summary ----------------------------------------------------------------
+
 solution_df |> 
-  filter(x4g_cong) |> 
-  select(solution) |> print(n = 100)
+  count(add_more_spectrum)
 
-# Summary -----------------------------------------------------------------
+solution_df_cc_closure |> 
+  count(add_more_spectrum)
 
-
-
-
-
+solution_df_cc_disolution |> 
+  count(add_more_spectrum)
