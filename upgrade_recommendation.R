@@ -19,7 +19,7 @@ library(DBI)
 # Parameters --------------------------------------------------------------
 
 tdd_adjustment <- 0.743
-l2600_penalty <- 0.6
+l2600_penalty <- 0.5
 # prb_congestion_threshold <- 0.6
 # prb_congestion_threshold_excl_l2600 <- 0.6
 # throughput_congestion_threshold <- 1e12
@@ -27,7 +27,7 @@ l2600_penalty <- 0.6
 nr_penetration_rate <- 0
 # cc_closure_carry_over_factor <- 0.4
 traffic_increase_upg_prop <- 1 # Not implemented, make it variable for congestion_recalculation()?
-monthly_growth_rate_1 <- (1.34^(1/12))^6 #Yearly growth rate converted to monthly compound to the power of the number of months forecasted
+monthly_growth_rate_1 <- (1.34^(1/12))^7 #Yearly growth rate converted to monthly compound to the power of the number of months forecasted
 monthly_growth_rate_2 <- (1.36^(1/12))^12 #to the power of the number of months forecasted
 monthly_growth_rate_3 <- (1.36^(1/12))^12 #to the power of the number of months forecasted
 monthly_growth_rate_4 <- (1.36^(1/12))^12 #to the power of the number of months forecasted
@@ -79,10 +79,7 @@ suggestion <- function(         cong_indicator,
 # Set paths ---------------------------------------------------------------
 
 x4g_path <- "D:/Radio_Network_Planning/bh_query_automation/lte/"
-x4g_files <- tibble(fn = list.files(x4g_path)) |> 
-  mutate(ds = ymd(str_extract(fn, '20[0-9]*'))) |> 
-  filter(ds >= Sys.Date() -181) |> 
-  pull(fn)
+x4g_files <- list.files(x4g_path)
 
 # Read 4G files -----------------------------------------------------------
 
@@ -147,20 +144,13 @@ nims_data <- dbGetQuery(nims_con, nims_query) |>
 
 dbDisconnect(nims_con)
 
-lte_operational_cells <- nims_data |> 
-  filter(technology == 'LTE') |> 
-  count(site_id, plan_status) |> 
-  pivot_wider(id_cols = site_id, names_from = plan_status, values_from = n) |> 
-  mutate(site_id = as.character(site_id))
-
 # Calculate LTE Sector Performance ----------------------------------------
 
 ## Base Performance ------------
 
-tictoc::tic()
 sector_prb <- df_4g |> 
   lazy_dt() |> 
-  filter(startday >= as.numeric(ymd(date_stamp)- 180)) |> 
+  filter(startday >= as.numeric(ymd(date_stamp)- 180), startday <= 20230609) |> 
   select(cell_name, startday, sector, nr_used_pdsch_prbs, nr_avail_dl_prbs) |> 
   arrange(cell_name, startday) |> 
   mutate(
@@ -176,20 +166,20 @@ sector_prb <- df_4g |>
   ) |> 
   mutate(
     daily_bh_prb_util = nr_used_pdsch_prbs/nr_avail_dl_prbs,
+    prb7 = if_else(as.numeric(ymd(date_stamp) - ymd(startday)) <= 7, daily_bh_prb_util, NA_real_),
     prb14 = if_else(as.numeric(ymd(date_stamp) - ymd(startday)) <= 14, daily_bh_prb_util, NA_real_),
-    prb28 = if_else(as.numeric(ymd(date_stamp) - ymd(startday)) <= 28, daily_bh_prb_util, NA_real_),
     prb60 = if_else(as.numeric(ymd(date_stamp) - ymd(startday)) <= 60, daily_bh_prb_util, NA_real_)
   ) |> 
   group_by(sector) |> 
   summarise(
     p75_all = quantile(daily_bh_prb_util, .75, na.rm = TRUE, names = FALSE),
-    p75_14   = quantile(prb14, .75, na.rm = TRUE, names = FALSE),
-    p75_28 = quantile(prb28, .75, na.rm = TRUE, names = FALSE),
-    p75_60  = quantile(prb60, .75, na.rm = TRUE, names = FALSE)
+    p75_7   = quantile(prb7, .75, na.rm = TRUE, names = FALSE),
+    p75_14  = quantile(prb14, .75, na.rm = TRUE, names = FALSE),
+    p75_60  = quantile(prb60, .75, na.rm = TRUE, names = FALSE),
     .groups = "drop"
   ) |> 
   mutate(
-    p75_prb_utilisation = coalesce(p75_14, p75_28, p75_60, p75_all),
+    p75_prb_utilisation = coalesce(p75_7, p75_14, p75_60, p75_all),
     p75_forecast_eoy1 = p75_prb_utilisation * monthly_growth_rate_1,
     p75_forecast_eoy2 = p75_forecast_eoy1 * monthly_growth_rate_2,
     p75_forecast_eoy3 = p75_forecast_eoy2 * monthly_growth_rate_3,
@@ -204,7 +194,6 @@ sector_prb <- df_4g |>
     p75_forecast_eoy4
     ) |> 
   as_tibble()
-tictoc::toc()
 
 ## sector planning info ------------
 
@@ -294,40 +283,40 @@ sector_info_60 <- sector_info_60 |>
 
 # FLTE --------------------------------------------------------------------
 
-# nims_con <- dbConnect(odbc::odbc(), "NMSDB_MNS_FWA", UID = "gis", 
-#                       PWD = "gis")
-# 
-# flte_query <- "
-# Select 
-# sector, 
-# MAX_ULTE_SPEED
-# from 
-#   GIS.PBI_MAX_SECTOR_U_SPEED
-# "
-# 
-# flte_data <- dbGetQuery(nims_con, flte_query) |> 
-#   collect() |> 
-#   clean_names() |> 
-#   mutate(prb_congestion_threshold = case_when(
-#     max_ulte_speed >= 20 ~ 0.4, 
-#     max_ulte_speed >= 10 ~ 0.5, 
-#     TRUE ~ 0.6
-#   ))
-# 
-# flte_data |> tabyl(prb_congestion_threshold, max_ulte_speed)
-# 
-# sector_info_flte <- sector_info |> 
-#   left_join(flte_data, by = "sector") |>
-#   mutate(prb_congestion_threshold = replace_na(prb_congestion_threshold, 0.6)) |> 
-#   mutate(
-#     x4g_cong = (p75_prb_utilisation > prb_congestion_threshold),
-#     x4g_cong_y1 = (p75_forecast_eoy1  > prb_congestion_threshold),
-#     x4g_cong_y2 = (p75_forecast_eoy2  > prb_congestion_threshold),
-#     x4g_cong_y3 = (p75_forecast_eoy3  > prb_congestion_threshold),
-#   )
-# 
-# rm(df_4g)
-# gc()
+nims_con <- dbConnect(odbc::odbc(), "NMSDB_MNS_FWA", UID = "gis", 
+                      PWD = "gis")
+
+flte_query <- "
+Select 
+sector, 
+MAX_ULTE_SPEED
+from 
+  GIS.PBI_MAX_SECTOR_U_SPEED
+"
+
+flte_data <- dbGetQuery(nims_con, flte_query) |> 
+  collect() |> 
+  clean_names() |> 
+  mutate(prb_congestion_threshold = case_when(
+    max_ulte_speed >= 20 ~ 0.4, 
+    max_ulte_speed >= 10 ~ 0.5, 
+    TRUE ~ 0.6
+  ))
+
+flte_data |> tabyl(prb_congestion_threshold, max_ulte_speed)
+
+sector_info_flte <- sector_info |> 
+  left_join(flte_data, by = "sector") |>
+  mutate(prb_congestion_threshold = replace_na(prb_congestion_threshold, 0.6)) |> 
+  mutate(
+    x4g_cong = (p75_prb_utilisation > prb_congestion_threshold),
+    x4g_cong_y1 = (p75_forecast_eoy1  > prb_congestion_threshold),
+    x4g_cong_y2 = (p75_forecast_eoy2  > prb_congestion_threshold),
+    x4g_cong_y3 = (p75_forecast_eoy3  > prb_congestion_threshold),
+  )
+
+rm(df_4g)
+gc()
 
 # Find solutions ----------------------------------------------------------
 
@@ -403,7 +392,7 @@ solution_df_y4 <- find_solutions(sector_info_60, x4g_cong_y3 , p75_forecast_eoy4
 #  Sector Summary ----------------------------------------------------------------
 
 solution_df_current |> 
-  count(solution, sort = TRUE)
+  count(solution)
 
 # Site level --------------------------------------------------------------
 
@@ -442,8 +431,7 @@ current_site_info <- cbu |>
   mutate(rn = row_number()) |> 
   ungroup() |> 
   filter(rn ==1) |> 
-  select(-rn) |> 
-  left_join(lte_operational_cells, by = 'site_id')
+  select(-rn)
 
 find_site_solution <- function(solution_df){
   # solution_df |>
